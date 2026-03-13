@@ -121,10 +121,11 @@ def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
                 "Name": {"title": []}, 
                 date_prop: {"date": {"start": date_str}},
                 reg_prop: {"number": reg_val},
-                elig_prop: {"number": elig_val}
+                elig_prop: {"number": elig_val},
+                "市场": {"select": {"name": "CME"}}  # <--- 新增的逻辑：为"市场"列赋值
             }
         )
-        print(f"[{metal_type}] 成功: 新增记录 {date_str}")
+        print(f"[{metal_type}] 成功: 新增记录 {date_str} (市场: CME)")
     except Exception as e:
         print(f"[{metal_type}] 失败: 写入 Notion 时报错: {e}")
 
@@ -150,7 +151,6 @@ def main():
                 
                 push_to_notion(metal, config["db_id"], date_str, reg_val, elig_val)
                 
-                # 【关键】速率保护：每处理完一个金属停顿 0.5 秒，避免被 Notion API 封禁
                 time.sleep(0.5)
                 
             except Exception as e:
