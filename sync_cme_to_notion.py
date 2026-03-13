@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import requests
 import xlrd
 from datetime import datetime
@@ -39,7 +40,7 @@ def get_latest_folder(repo):
     response = requests.get(api_url)
     response.raise_for_status()
     folders = [item['name'] for item in response.json() if item['type'] == 'dir']
-    latest_folder = sorted(folders)[-1] # 假设文件夹命名如 YYYY-MM-DD，可以直接字典排序
+    latest_folder = sorted(folders)[-1] 
     return latest_folder
 
 def download_file(url, save_path):
@@ -51,7 +52,6 @@ def download_file(url, save_path):
 
 def parse_cme_excel(filepath, reg_coords, elig_coords):
     """解析 Excel 获取 Date, Reg, Elig"""
-    # 注意：如果 CME 的文件本质是 HTML (假 .xls)，这里可能需要替换为 pandas.read_html
     book = xlrd.open_workbook(filepath, ignore_workbook_corruption=True)
     sheet = book.sheet_by_index(0)
     
@@ -65,7 +65,7 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
                 match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', cell_val)
                 if match:
                     raw_date = match.group(1)
-                    # 转换为 Notion 需要的 YYYY-MM-DD
+                    # 无论 Notion UI 如何显示，此处必须转换为标准的 YYYY-MM-DD 交给 API
                     date_obj = datetime.strptime(raw_date, "%m/%d/%Y")
                     activity_date = date_obj.strftime("%Y-%m-%d")
                     break
@@ -78,34 +78,61 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
     
     return activity_date, float(reg_val), float(elig_val)
 
+def check_if_date_exists(db_id, date_prop, date_str):
+    """向 Notion 发送 Query 请求，检查特定日期是否已存在"""
+    try:
+        response = notion.databases.query(
+            **{
+                "database_id": db_id,
+                "filter": {
+                    "property": date_prop,
+                    "date": {
+                        "equals": date_str
+                    }
+                }
+            }
+        )
+        return len(response.get("results", [])) > 0
+    except Exception as e:
+        print(f"查询数据库验证去重时发生错误: {e}")
+        return False
+
 def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
     """将数据推送到对应的 Notion Database"""
     if not date_str:
-        print(f"[{metal_type}] Warning: No date found, skipping.")
+        print(f"[{metal_type}] 警告: 未找到有效日期，跳过。")
         return
 
-    # Notion 属性名称构建
     date_prop = f"{metal_type}日期"
     reg_prop = f"{metal_type} Reg库存"
     elig_prop = f"{metal_type} Elig库存"
+
+    # 执行去重检查
+    if check_if_date_exists(db_id, date_prop, date_str):
+        print(f"[{metal_type}] 拦截: Notion 中已存在 {date_str} 的数据，终止写入以防重复。")
+        return
 
     try:
         notion.pages.create(
             parent={"database_id": db_id},
             properties={
-                "Name": {"title": []}, # 对应截图中的无名 Name 列，留空
+                "Name": {"title": []}, 
                 date_prop: {"date": {"start": date_str}},
                 reg_prop: {"number": reg_val},
                 elig_prop: {"number": elig_val}
             }
         )
-        print(f"[{metal_type}] Successfully added record for {date_str}.")
+        print(f"[{metal_type}] 成功: 已添加 {date_str} 的新记录。")
     except Exception as e:
-        print(f"[{metal_type}] Failed to push to Notion: {e}")
+        print(f"[{metal_type}] 失败: 写入 Notion 时报错: {e}")
 
 def main():
-    latest_folder = get_latest_folder(GITHUB_REPO)
-    print(f"Found latest data folder: {latest_folder}")
+    try:
+        latest_folder = get_latest_folder(GITHUB_REPO)
+        print(f"发现最新数据目录: {latest_folder}")
+    except Exception as e:
+        print(f"获取 GitHub 目录失败: {e}")
+        return
     
     for metal, config in CONFIG.items():
         filename = config["filename"]
@@ -116,11 +143,15 @@ def main():
             date_str, reg_val, elig_val = parse_cme_excel(
                 filename, config["reg_coords"], config["elig_coords"]
             )
-            print(f"[{metal}] Parsed Data -> Date: {date_str}, Reg: {reg_val}, Elig: {elig_val}")
+            print(f"[{metal}] Excel 解析完毕 -> 日期: {date_str}, Reg: {reg_val}, Elig: {elig_val}")
             
             push_to_notion(metal, config["db_id"], date_str, reg_val, elig_val)
+            
+            # 引入停顿，防止触发 Notion API 的速率限制
+            time.sleep(1)
+            
         except Exception as e:
-            print(f"Error processing {metal}: {e}")
+            print(f"处理 {metal} 任务时发生错误: {e}")
 
 if __name__ == "__main__":
     main()
