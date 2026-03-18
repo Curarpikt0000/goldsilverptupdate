@@ -14,7 +14,7 @@ notion = Client(auth=NOTION_TOKEN)
 # 运行模式设置：
 # "latest" -> 只扫描 GitHub 中最新的一天（用于每日定时任务）
 # "all"    -> 扫描 GitHub 中所有的历史日期（用于补录 3-14 到 3-17 的数据）
-SYNC_MODE = "all" 
+SYNC_MODE = "latest" 
 
 CONFIG = {
     "Gold": {
