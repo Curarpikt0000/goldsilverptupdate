@@ -13,7 +13,7 @@ notion = Client(auth=NOTION_TOKEN)
 
 # 运行模式设置：
 # "latest" -> 只扫描 GitHub 中最新的一天（用于每日定时任务）
-# "all"    -> 扫描 GitHub 中所有的历史日期（用于首次补全）
+# "all"    -> 扫描 GitHub 中所有的历史日期（用于补录 3-14 到 3-17 的数据）
 SYNC_MODE = "latest" 
 
 CONFIG = {
@@ -38,13 +38,17 @@ CONFIG = {
 }
 
 def get_target_folders(repo, mode="latest"):
-    """根据模式获取 GitHub data 目录下的文件夹列表"""
+    """根据模式获取 GitHub data 目录下的有效日期文件夹"""
     api_url = f"https://api.github.com/repos/{repo}/contents/data"
     response = requests.get(api_url)
     response.raise_for_status()
     
-    folders = [item['name'] for item in response.json() if item['type'] == 'dir']
-    sorted_folders = sorted(folders) # 按日期升序排列 (旧 -> 新)
+    # 过滤出符合 YYYY-MM-DD 格式的文件夹名，确保排序准确
+    folders = [
+        item['name'] for item in response.json() 
+        if item['type'] == 'dir' and re.match(r'\d{4}-\d{2}-\d{2}', item['name'])
+    ]
+    sorted_folders = sorted(folders) 
     
     if mode == "latest":
         return [sorted_folders[-1]] if sorted_folders else []
@@ -63,7 +67,8 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
     sheet = book.sheet_by_index(0)
     
     activity_date = None
-    for row_idx in range(min(50, sheet.nrows)):
+    # 增加搜索深度，防止大型表格漏掉日期行
+    for row_idx in range(min(150, sheet.nrows)):
         for col_idx in range(min(10, sheet.ncols)):
             cell_val = str(sheet.cell_value(row_idx, col_idx))
             if "Activity Date:" in cell_val:
@@ -76,22 +81,21 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
         if activity_date:
             break
 
+    # 获取库存数值
     reg_val = sheet.cell_value(reg_coords[0], reg_coords[1])
     elig_val = sheet.cell_value(elig_coords[0], elig_coords[1])
     
     return activity_date, float(reg_val), float(elig_val)
 
 def check_if_date_exists(db_id, date_prop, date_str):
-    """向 Notion 发送 Query 请求，检查特定日期是否已存在"""
+    """【修复版】使用显式参数调用，适配新版 SDK"""
     try:
         response = notion.databases.query(
-            **{
-                "database_id": db_id,
-                "filter": {
-                    "property": date_prop,
-                    "date": {
-                        "equals": date_str
-                    }
+            database_id=db_id,
+            filter={
+                "property": date_prop,
+                "date": {
+                    "equals": date_str
                 }
             }
         )
@@ -118,11 +122,11 @@ def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
         notion.pages.create(
             parent={"database_id": db_id},
             properties={
-                "Name": {"title": []}, 
+                "Name": {"title": [{"text": {"content": f"{metal_type} {date_str}"}}]},
                 date_prop: {"date": {"start": date_str}},
                 reg_prop: {"number": reg_val},
                 elig_prop: {"number": elig_val},
-                "市场": {"select": {"name": "CME"}}  # <--- 新增的逻辑：为"市场"列赋值
+                "市场": {"select": {"name": "CME"}}
             }
         )
         print(f"[{metal_type}] 成功: 新增记录 {date_str} (市场: CME)")
@@ -150,7 +154,6 @@ def main():
                 )
                 
                 push_to_notion(metal, config["db_id"], date_str, reg_val, elig_val)
-                
                 time.sleep(0.5)
                 
             except Exception as e:
