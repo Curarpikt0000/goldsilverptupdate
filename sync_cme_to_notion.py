@@ -8,10 +8,8 @@ from datetime import datetime
 from notion_client import Client
 
 # ---------------- 配置区 ----------------
-# 重点检查：你的数据仓库到底是哪个？
-# 如果 cme_bot.py 传到了 cme-data-archive，这里必须改成那个名字
 GITHUB_REPO = "Curarpikt0000/cme-data-archive" 
-GITHUB_TOKEN = os.getenv("GH_PERSONAL_TOKEN") # 建议确保这个环境变量已设置
+GITHUB_TOKEN = os.getenv("GH_PERSONAL_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 notion = Client(auth=NOTION_TOKEN)
 
@@ -39,42 +37,25 @@ CONFIG = {
 }
 
 def get_target_folders(repo, mode="latest"):
-    """获取并按时间严格排序文件夹"""
     api_url = f"https://api.github.com/repos/{repo}/contents/data"
-    
-    # 增加时间戳防止 API 缓存
-    headers = {
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
-    }
+    headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
         
-    print(f"正在从仓库 {repo} 请求目录列表...")
     response = requests.get(api_url, headers=headers)
     response.raise_for_status()
     
-    # 调试：打印所有发现的文件夹
     all_dirs = [item['name'] for item in response.json() if item['type'] == 'dir']
-    print(f"GitHub 目录下的所有文件夹: {all_dirs}")
-    
-    folder_items = [
-        name for name in all_dirs if re.match(r'\d{4}-\d{2}-\d{2}', name)
-    ]
+    folder_items = [name for name in all_dirs if re.match(r'\d{4}-\d{2}-\d{2}', name)]
     
     if not folder_items:
         return []
 
-    # 严格按日期排序
     sorted_folders = sorted(folder_items, key=lambda x: datetime.strptime(x, "%Y-%m-%d"))
     
     if mode == "latest":
-        latest = sorted_folders[-1]
-        print(f"确定最新文件夹为: {latest}")
-        return [latest]
+        return [sorted_folders[-1]]
     return sorted_folders
-
-# ... (parse_cme_excel 和 push_to_notion 函数保持不变) ...
 
 def parse_cme_excel(filepath, reg_coords, elig_coords):
     try:
@@ -99,37 +80,61 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
 
 def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
     date_prop = f"{metal_type}日期"
-    exists = notion.databases.query(
-        database_id=db_id,
-        filter={"property": date_prop, "date": {"equals": date_str}}
-    ).get("results")
-    if exists:
-        print(f"[{metal_type}] 跳过: {date_str} 已存在")
+    exists = []
+    
+    # 【核心修复】兼容 Notion 最新版 API (Data Sources) 的查询逻辑
+    try:
+        if hasattr(notion, 'data_sources'):
+            # 新版 SDK 逻辑：获取 DataSource ID 然后 Query
+            db_info = notion.databases.retrieve(database_id=db_id)
+            if "data_sources" in db_info and len(db_info["data_sources"]) > 0:
+                ds_id = db_info["data_sources"][0]["id"]
+                exists = notion.data_sources.query(
+                    data_source_id=ds_id,
+                    filter={"property": date_prop, "date": {"equals": date_str}}
+                ).get("results", [])
+        else:
+            # 兼容极个别旧版 SDK 的兜底逻辑
+            exists = notion.databases.query(
+                database_id=db_id,
+                filter={"property": date_prop, "date": {"equals": date_str}}
+            ).get("results", [])
+    except Exception as e:
+        print(f"[{metal_type}] 执行去重查询时出错: {e}")
         return
-    notion.pages.create(
-        parent={"database_id": db_id},
-        properties={
-            "Name": {"title": [{"text": {"content": f"{metal_type} {date_str}"}}]},
-            date_prop: {"date": {"start": date_str}},
-            f"{metal_type} Reg库存": {"number": reg_val},
-            f"{metal_type} Elig库存": {"number": elig_val},
-            "市场": {"select": {"name": "CME"}}
-        }
-    )
-    print(f"[{metal_type}] 成功同步: {date_str}")
+
+    # 去重判断
+    if exists:
+        print(f"[{metal_type}] 跳过: {date_str} 数据已存在")
+        return
+
+    # 写入新数据
+    try:
+        notion.pages.create(
+            parent={"database_id": db_id},
+            properties={
+                "Name": {"title": [{"text": {"content": f"{metal_type} {date_str}"}}]},
+                date_prop: {"date": {"start": date_str}},
+                f"{metal_type} Reg库存": {"number": reg_val},
+                f"{metal_type} Elig库存": {"number": elig_val},
+                "市场": {"select": {"name": "CME"}}
+            }
+        )
+        print(f"[{metal_type}] 成功同步: {date_str}")
+    except Exception as e:
+        print(f"[{metal_type}] 写入 Notion 失败: {e}")
 
 def main():
     target_folders = get_target_folders(GITHUB_REPO, mode=SYNC_MODE)
     
     if not target_folders:
-        print("❌ 未发现有效日期文件夹，请检查仓库路径和 data 目录内容。")
-        sys.exit(1) # 报错红灯
+        print("❌ 未发现有效日期文件夹")
+        sys.exit(1)
     
     for folder in target_folders:
         print(f"\n--- 正在处理日期: {folder} ---")
         for metal, config in CONFIG.items():
             filename = config["filename"]
-            # 增加随机参数绕过 Raw 下载缓存
             raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/data/{folder}/{filename}?t={int(time.time())}"
             
             try:
