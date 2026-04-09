@@ -3,16 +3,18 @@ import re
 import time
 import requests
 import xlrd
+import sys
 from datetime import datetime
 from notion_client import Client
 
 # ---------------- 配置区 ----------------
-# 确保仓库名正确（根据你提供的代码，数据存放在 cme-tracker 的 data 目录下）
-GITHUB_REPO = "Curarpikt0000/cme-tracker" 
+# 重点检查：你的数据仓库到底是哪个？
+# 如果 cme_bot.py 传到了 cme-data-archive，这里必须改成那个名字
+GITHUB_REPO = "Curarpikt0000/cme-data-archive" 
+GITHUB_TOKEN = os.getenv("GH_PERSONAL_TOKEN") # 建议确保这个环境变量已设置
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 notion = Client(auth=NOTION_TOKEN)
 
-# 建议保持 "latest"，但我优化了 "latest" 的定义
 SYNC_MODE = "latest" 
 
 CONFIG = {
@@ -23,13 +25,13 @@ CONFIG = {
         "elig_coords": (123, 7)  
     },
     "Silver": {
-        "filename": "Silver_stocks.xls", # 修正：与下载端的 s 小写保持一致
+        "filename": "Silver_stocks.xls", 
         "db_id": "2bc47eb5fd3c80f3a71ad8de149a4943",
         "reg_coords": (72, 7),   
         "elig_coords": (73, 7)   
     },
     "Pt": {
-        "filename": "PA-PL_Stck_Rprt.xls", # 修正：对应下载端的铂金文件名
+        "filename": "PA-PL_Stck_Rprt.xls",
         "db_id": "2d647eb5fd3c801a9ce5d5db4d0b961a",
         "reg_coords": (71, 7),   
         "elig_coords": (72, 7)   
@@ -39,33 +41,45 @@ CONFIG = {
 def get_target_folders(repo, mode="latest"):
     """获取并按时间严格排序文件夹"""
     api_url = f"https://api.github.com/repos/{repo}/contents/data"
-    # 如果有 GitHub Token 建议加上，防止 API 限流
-    headers = {"Authorization": f"token {os.getenv('GH_PERSONAL_TOKEN')}"} if os.getenv('GH_PERSONAL_TOKEN') else {}
+    
+    # 增加时间戳防止 API 缓存
+    headers = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+        
+    print(f"正在从仓库 {repo} 请求目录列表...")
     response = requests.get(api_url, headers=headers)
     response.raise_for_status()
     
-    # 提取符合日期格式的文件夹，并转换为 datetime 对象排序
+    # 调试：打印所有发现的文件夹
+    all_dirs = [item['name'] for item in response.json() if item['type'] == 'dir']
+    print(f"GitHub 目录下的所有文件夹: {all_dirs}")
+    
     folder_items = [
-        item['name'] for item in response.json() 
-        if item['type'] == 'dir' and re.match(r'\d{4}-\d{2}-\d{2}', item['name'])
+        name for name in all_dirs if re.match(r'\d{4}-\d{2}-\d{2}', name)
     ]
     
     if not folder_items:
         return []
 
-    # 按照真实日期数值排序，而不是字符串排序
+    # 严格按日期排序
     sorted_folders = sorted(folder_items, key=lambda x: datetime.strptime(x, "%Y-%m-%d"))
     
     if mode == "latest":
-        return [sorted_folders[-1]] # 取日期最大的那一个
+        latest = sorted_folders[-1]
+        print(f"确定最新文件夹为: {latest}")
+        return [latest]
     return sorted_folders
 
+# ... (parse_cme_excel 和 push_to_notion 函数保持不变) ...
+
 def parse_cme_excel(filepath, reg_coords, elig_coords):
-    """解析 Excel 获取数据"""
     try:
         book = xlrd.open_workbook(filepath, ignore_workbook_corruption=True)
         sheet = book.sheet_by_index(0)
-        
         activity_date = None
         for row_idx in range(min(150, sheet.nrows)):
             for col_idx in range(min(10, sheet.ncols)):
@@ -73,11 +87,9 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
                 if "Activity Date:" in cell_val:
                     match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', cell_val)
                     if match:
-                        date_obj = datetime.strptime(match.group(1), "%m/%d/%Y")
-                        activity_date = date_obj.strftime("%Y-%m-%d")
+                        activity_date = datetime.strptime(match.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
                         break
             if activity_date: break
-
         reg_val = sheet.cell_value(reg_coords[0], reg_coords[1])
         elig_val = sheet.cell_value(elig_coords[0], elig_coords[1])
         return activity_date, float(reg_val), float(elig_val)
@@ -86,19 +98,14 @@ def parse_cme_excel(filepath, reg_coords, elig_coords):
         return None, 0, 0
 
 def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
-    """写入 Notion 并包含查重逻辑"""
     date_prop = f"{metal_type}日期"
-    
-    # 显式查重
     exists = notion.databases.query(
         database_id=db_id,
         filter={"property": date_prop, "date": {"equals": date_str}}
     ).get("results")
-
     if exists:
-        print(f"[{metal_type}] 跳过: {date_str} 数据已存在")
+        print(f"[{metal_type}] 跳过: {date_str} 已存在")
         return
-
     notion.pages.create(
         parent={"database_id": db_id},
         properties={
@@ -113,18 +120,22 @@ def push_to_notion(metal_type, db_id, date_str, reg_val, elig_val):
 
 def main():
     target_folders = get_target_folders(GITHUB_REPO, mode=SYNC_MODE)
-    print(f"准备处理文件夹: {target_folders}")
+    
+    if not target_folders:
+        print("❌ 未发现有效日期文件夹，请检查仓库路径和 data 目录内容。")
+        sys.exit(1) # 报错红灯
     
     for folder in target_folders:
+        print(f"\n--- 正在处理日期: {folder} ---")
         for metal, config in CONFIG.items():
             filename = config["filename"]
-            raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/data/{folder}/{filename}"
+            # 增加随机参数绕过 Raw 下载缓存
+            raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/data/{folder}/{filename}?t={int(time.time())}"
             
             try:
-                # 下载临时文件
                 r = requests.get(raw_url)
                 if r.status_code != 200:
-                    print(f"跳过: {metal} 在文件夹 {folder} 中不存在")
+                    print(f"跳过: {metal} (404 Not Found at {folder})")
                     continue
                 
                 with open(filename, 'wb') as f:
@@ -134,7 +145,6 @@ def main():
                 
                 if date_str:
                     push_to_notion(metal, config["db_id"], date_str, reg_val, elig_val)
-                
                 time.sleep(0.5)
             except Exception as e:
                 print(f"处理 {metal} 时出错: {e}")
